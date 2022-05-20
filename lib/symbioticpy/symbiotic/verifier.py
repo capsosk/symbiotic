@@ -32,6 +32,21 @@ class ToolWatch(ProcessWatch):
             msg = line.decode('utf-8', 'replace')
             dbg(msg, 'all', print_nl=msg[-1] != '\n', prefix='', color=None)
 
+class CGWatch(ProcessWatch):
+    def __init__(self):
+        ProcessWatch.__init__(self, None)
+        #self.calls = {}
+        self.called = {}
+
+    def parse(self, line):
+        if b"->" in line:
+            parts = line.split(b"->")
+            assert len(parts) == 2, parts
+            caller = parts[0].strip()[1:-1].decode('utf-8')
+            called = parts[1].strip()[1:-1].decode('utf-8')
+            #self.calls.setdefault(caller, []).append(called)
+            self.called.setdefault(called, []).append(caller)
+
 class SymbioticVerifier(object):
     """
     Instance of symbiotic tool. Instruments, prepares, compiles and runs
@@ -104,8 +119,69 @@ class SymbioticVerifier(object):
             params = params + addparams
         prp = self.options.property.getPrpFile()
 
-        # do it!
-        return self._run_tool(tool, prp, params, timeout)
+        # get callgraph
+        watch = CGWatch()
+        process = ProcessRunner()
+        cmd = ['llvm-cg-dump', '--use-pta=false', self.curfile]
+        returncode = process.run(cmd, watch)
+        if returncode != 0:
+            dbg('Failed creating CG')
+
+        called = watch.called
+
+        explored_funs = set()
+        callers = called.get('reach_error')
+        
+        if not callers:
+        # we would return unknown anyway, might as well try from main
+            callers = ['main']
+        
+        while callers:
+            newcallers = []
+            all_true = True
+            for start in callers:
+                if start in explored_funs:
+                    continue
+                print_stdout(f'ICE: starting from {start}')
+                tmpparams = params + ['-lazy-init', '-ignore-lazy-oob', f'-entry-point={start}']
+                if start != 'main':
+                    tmpparams.append('-max-time=30')
+                    tmpparams.append('-exit-on-error-type=Ptr')
+                    tmpparams.append('-exit-on-error-type=ReadOnly')
+                    tmpparams.append('-exit-on-error-type=Free')
+                    tmpparams.append('-exit-on-error-type=BadVectorAccess')
+                tmpparams.append('-exit-on-error-type=Assert')
+
+                explored_funs.add(start)
+                res, watch = self._run_tool(tool, prp, tmpparams, timeout)
+                sw = res.lower().startswith
+
+                # if the function was main, we can quit.
+                if start == 'main': 
+                    return res, tool
+                
+                # true answer is okay, just go on. 
+                if sw('true'):
+                    continue
+                # false answer has to be investigated further in
+                elif sw('false'):
+                    tmp = called.get(start)
+                    if tmp:
+                        all_true = False
+                        newcallers.extend(tmp)
+                    # no caller means fine (if CG is sound)
+                # this means unknown answer, proceed with execution
+                else:
+                    tmp = called.get(start)
+                    if tmp:
+                        all_true = False
+                        newcallers.extend(tmp)
+                    
+            if all_true:
+                return 'true', tool
+            callers = newcallers
+
+        return 'error(no more callers)', watch
 
     def run_verification(self):
         print_stdout('INFO: Starting verification', color='WHITE')
